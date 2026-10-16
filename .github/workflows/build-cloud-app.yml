@@ -22,6 +22,18 @@ jobs:
         with:
           gradle-version: '8.9'
 
+      - name: Restore signing key cache
+        uses: actions/cache@v4
+        with:
+          path: release.keystore
+          key: img2video-signing-key-v1
+
+      - name: Create signing key if missing
+        run: |
+          if [ ! -f release.keystore ]; then
+            keytool -genkeypair -keystore release.keystore -storepass android123 -keypass android123 -alias key0 -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Img2Video"
+          fi
+
       - name: Create project files
         run: |
           mkdir -p app-project/app/src/main/java/com/img2video/app
@@ -70,11 +82,23 @@ jobs:
                   applicationId 'com.img2video.app'
                   minSdk 29
                   targetSdk 34
-                  versionCode 1
-                  versionName '1.0'
+                  versionCode 2
+                  versionName '2.0'
+              }
+
+              signingConfigs {
+                  stable {
+                      storeFile file(System.getenv('GITHUB_WORKSPACE') + '/release.keystore')
+                      storePassword 'android123'
+                      keyAlias 'key0'
+                      keyPassword 'android123'
+                  }
               }
 
               buildTypes {
+                  debug {
+                      signingConfig signingConfigs.stable
+                  }
                   release {
                       minifyEnabled false
                   }
@@ -126,172 +150,462 @@ jobs:
           package com.img2video.app;
 
           import android.app.Activity;
+          import android.app.AlertDialog;
           import android.content.ContentValues;
           import android.content.Intent;
           import android.content.SharedPreferences;
+          import android.content.res.ColorStateList;
           import android.graphics.Bitmap;
           import android.graphics.BitmapFactory;
           import android.graphics.Matrix;
+          import android.graphics.drawable.GradientDrawable;
           import android.media.ExifInterface;
           import android.net.Uri;
           import android.os.Bundle;
+          import android.os.Handler;
+          import android.os.Looper;
           import android.provider.MediaStore;
           import android.text.InputType;
+          import android.view.Gravity;
           import android.view.View;
+          import android.view.ViewGroup;
+          import android.widget.AdapterView;
+          import android.widget.ArrayAdapter;
           import android.widget.Button;
           import android.widget.EditText;
+          import android.widget.FrameLayout;
+          import android.widget.HorizontalScrollView;
           import android.widget.ImageView;
           import android.widget.LinearLayout;
-          import android.widget.MediaController;
           import android.widget.ProgressBar;
           import android.widget.ScrollView;
           import android.widget.SeekBar;
+          import android.widget.Spinner;
           import android.widget.TextView;
           import android.widget.Toast;
           import android.widget.VideoView;
 
-          import org.json.JSONArray;
-          import org.json.JSONObject;
-
-          import java.io.BufferedReader;
           import java.io.ByteArrayOutputStream;
           import java.io.File;
           import java.io.FileInputStream;
-          import java.io.FileOutputStream;
           import java.io.IOException;
           import java.io.InputStream;
-          import java.io.InputStreamReader;
           import java.io.OutputStream;
-          import java.net.HttpURLConnection;
-          import java.net.URL;
-          import java.nio.charset.StandardCharsets;
+          import java.util.ArrayList;
+          import java.util.Locale;
 
           public class MainActivity extends Activity {
-              private static final String HOST = "https://zerogpu-aoti-wan2-2-fp8da-aoti-faster.hf.space";
-              private static final String API_NAME = "generate_video";
-              private static final String DEFAULT_PROMPT = "make this image come alive, cinematic motion, smooth animation";
+              private static final int MATCH = ViewGroup.LayoutParams.MATCH_PARENT;
+              private static final int WRAP = ViewGroup.LayoutParams.WRAP_CONTENT;
               private static final int REQ_PICK = 1;
+              private static final String DEFAULT_PROMPT = "make this image come alive, cinematic motion, smooth animation";
 
+              // Built-in list: Space id, title, description (statuses were not re-checked today)
+              private static final String[][] BUILTIN = {
+                      {"zerogpu-aoti/wan2-2-fp8da-aoti-faster", "Wan 2.2 14B Fast", "الأكثر استخدامًا وسرعة (موصى به)"},
+                      {"r3gm/wan2-2-fp8da-aoti-preview", "Wan 2.2 14B Preview", "نسخة معاينة من Wan 2.2"},
+                      {"dream2589632147/Dream-wan2-2-faster-Pro", "Dream Wan 2.2 Pro", "حركة سينمائية بنموذج Wan 2.2"},
+                      {"venom2672/wan22-i2v-demo", "Wan 2.2 Lightning", "عرض سريع بنموذج Wan 2.2"},
+                      {"multimodalart/LongCat-Video", "LongCat Video", "فيديو من صورة أو نص"},
+                      {"FrameAI4687/Omni-Video-Factory", "Omni Video Factory", "نص أو صورة إلى فيديو"},
+                      {"akhaliq/Ovi", "Ovi", "فيديو مع صوت من صورة"},
+              };
+
+              private static final String[] CHIP_LABELS = {
+                      "🎥 حركة سينمائية", "🌬️ رياح وشعر", "🔍 تقريب بطيء", "😊 ابتسامة", "🌊 طبيعة حيّة"};
+              private static final String[] CHIP_PROMPTS = {
+                      "cinematic camera movement, smooth motion, high quality",
+                      "gentle wind blowing through hair and clothes, natural motion",
+                      "slow zoom in, subtle motion, cinematic",
+                      "the person smiles naturally and blinks, subtle head movement",
+                      "water ripples, clouds moving, leaves swaying, living nature"};
+
+              private final ArrayList<String> ids = new ArrayList<>();
+              private final ArrayList<String> titles = new ArrayList<>();
+              private final ArrayList<String> descs = new ArrayList<>();
+              private final Handler handler = new Handler(Looper.getMainLooper());
+
+              private SharedPreferences prefs;
+              private ArrayAdapter<String> adapter;
+              private Spinner modelSpinner;
+              private TextView modelDesc;
+              private Button removeBtn;
+              private LinearLayout placeholder;
               private ImageView preview;
               private EditText promptEdit;
               private EditText tokenEdit;
               private TextView durationLabel;
-              private TextView statusText;
               private SeekBar durationSeek;
               private Button genBtn;
-              private Button saveBtn;
+              private LinearLayout statusCard;
+              private TextView statusText;
+              private TextView timerText;
               private ProgressBar progress;
+              private LinearLayout resultCard;
               private VideoView videoView;
+
               private byte[] imageBytes;
               private File resultFile;
-              private String prefix = "/gradio_api";
-              private SharedPreferences prefs;
+              private Uri savedUri;
+              private long genStart;
+
+              private final Runnable ticker = new Runnable() {
+                  @Override
+                  public void run() {
+                      long s = (System.currentTimeMillis() - genStart) / 1000;
+                      timerText.setText(String.format(Locale.US, "%02d:%02d", s / 60, s % 60));
+                      handler.postDelayed(this, 1000);
+                  }
+              };
+
+              // ================================================================ UI
 
               @Override
               protected void onCreate(Bundle savedInstanceState) {
                   super.onCreate(savedInstanceState);
                   prefs = getSharedPreferences("i2v", MODE_PRIVATE);
+                  loadModels();
 
                   ScrollView sv = new ScrollView(this);
+                  sv.setBackgroundColor(Ui.BG);
+                  sv.setLayoutDirection(View.LAYOUT_DIRECTION_RTL);
                   LinearLayout root = new LinearLayout(this);
                   root.setOrientation(LinearLayout.VERTICAL);
-                  root.setPadding(dp(20), dp(40), dp(20), dp(30));
-                  sv.addView(root);
+                  sv.addView(root, new ViewGroup.LayoutParams(MATCH, WRAP));
 
-                  TextView title = new TextView(this);
-                  title.setText("تحويل الصورة إلى فيديو");
-                  title.setTextSize(22);
-                  root.addView(title);
+                  // ---- header
+                  LinearLayout header = new LinearLayout(this);
+                  header.setOrientation(LinearLayout.VERTICAL);
+                  GradientDrawable hg = new GradientDrawable(GradientDrawable.Orientation.TL_BR,
+                          new int[]{0xFF4F46E5, 0xFF8B5CF6});
+                  float r = Ui.dp(this, 28);
+                  hg.setCornerRadii(new float[]{0, 0, 0, 0, r, r, r, r});
+                  header.setBackground(hg);
+                  header.setPadding(Ui.dp(this, 24), Ui.dp(this, 52), Ui.dp(this, 24), Ui.dp(this, 28));
+                  header.addView(Ui.text(this, "🎬 صورة إلى فيديو", 28, 0xFFFFFFFF, true));
+                  header.addView(Ui.text(this, "حوّل أي صورة إلى فيديو قصير بالذكاء الاصطناعي عبر نماذج مجانية",
+                          14, 0xCCFFFFFF, false), Ui.lp(this, WRAP, WRAP, 6));
+                  root.addView(header, new LinearLayout.LayoutParams(MATCH, WRAP));
 
-                  TextView note = new TextView(this);
-                  note.setText("يعمل عبر خدمة مجانية في السحابة، فقد تنتظر في الطابور، وللخدمة حصة يومية.");
-                  note.setTextSize(13);
-                  root.addView(note);
+                  LinearLayout content = new LinearLayout(this);
+                  content.setOrientation(LinearLayout.VERTICAL);
+                  content.setPadding(Ui.dp(this, 16), Ui.dp(this, 4), Ui.dp(this, 16), Ui.dp(this, 32));
+                  root.addView(content, new LinearLayout.LayoutParams(MATCH, WRAP));
 
-                  Button pickBtn = new Button(this);
-                  pickBtn.setText("1) اختر صورة");
-                  pickBtn.setOnClickListener(v -> pickImage());
-                  root.addView(pickBtn);
-
+                  // ---- card 1: image
+                  LinearLayout c1 = Ui.card(this);
+                  c1.addView(Ui.text(this, "١  اختر الصورة", 16, Ui.TEXT, true));
+                  FrameLayout box = new FrameLayout(this);
+                  GradientDrawable dash = Ui.rect(this, 0xFFFAFAFF, 14);
+                  dash.setStroke(Ui.dp(this, 2), 0xFFB9BCE8, Ui.dp(this, 8), Ui.dp(this, 6));
+                  box.setBackground(dash);
+                  placeholder = new LinearLayout(this);
+                  placeholder.setOrientation(LinearLayout.VERTICAL);
+                  placeholder.setGravity(Gravity.CENTER);
+                  placeholder.addView(Ui.text(this, "🖼️", 40, Ui.TEXT, false));
+                  placeholder.addView(Ui.text(this, "اضغط لاختيار صورة من المعرض", 14, Ui.MUTED, false));
+                  box.addView(placeholder, new FrameLayout.LayoutParams(MATCH, MATCH));
                   preview = new ImageView(this);
-                  preview.setAdjustViewBounds(true);
                   preview.setScaleType(ImageView.ScaleType.FIT_CENTER);
-                  root.addView(preview, new LinearLayout.LayoutParams(
-                          LinearLayout.LayoutParams.MATCH_PARENT, dp(220)));
+                  preview.setVisibility(View.GONE);
+                  box.addView(preview, new FrameLayout.LayoutParams(MATCH, MATCH));
+                  Ui.clipRound(box, Ui.dp(this, 14));
+                  box.setOnClickListener(v -> pickImage());
+                  c1.addView(box, Ui.lp(this, MATCH, Ui.dp(this, 230), 12));
+                  content.addView(c1, Ui.lp(this, MATCH, WRAP, 14));
 
+                  // ---- card 2: model
+                  LinearLayout c2 = Ui.card(this);
+                  c2.addView(Ui.text(this, "٢  اختر النموذج", 16, Ui.TEXT, true));
+                  modelSpinner = new Spinner(this);
+                  modelSpinner.setBackground(Ui.rect(this, Ui.BG, 12, Ui.BORDER, 1));
+                  modelSpinner.setPadding(Ui.dp(this, 8), 0, Ui.dp(this, 8), 0);
+                  adapter = new ArrayAdapter<String>(this, android.R.layout.simple_spinner_item, titles) {
+                      @Override
+                      public View getView(int pos, View cv, ViewGroup parent) {
+                          TextView t = (TextView) super.getView(pos, cv, parent);
+                          t.setTextColor(Ui.TEXT);
+                          t.setTextSize(15);
+                          return t;
+                      }
+
+                      @Override
+                      public View getDropDownView(int pos, View cv, ViewGroup parent) {
+                          TextView t = (TextView) super.getDropDownView(pos, cv, parent);
+                          t.setTextColor(Ui.TEXT);
+                          t.setTextSize(15);
+                          t.setPadding(Ui.dp(MainActivity.this, 16), Ui.dp(MainActivity.this, 14),
+                                  Ui.dp(MainActivity.this, 16), Ui.dp(MainActivity.this, 14));
+                          return t;
+                      }
+                  };
+                  adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+                  modelSpinner.setAdapter(adapter);
+                  c2.addView(modelSpinner, Ui.lp(this, MATCH, Ui.dp(this, 52), 10));
+                  modelDesc = Ui.text(this, "", 13, Ui.MUTED, false);
+                  c2.addView(modelDesc, Ui.lp(this, MATCH, WRAP, 8));
+
+                  LinearLayout row = new LinearLayout(this);
+                  row.setOrientation(LinearLayout.HORIZONTAL);
+                  Button addBtn = Ui.button(this, "＋ إضافة Space", Ui.CHIP, Ui.PRIMARY, 12);
+                  addBtn.setTextSize(14);
+                  addBtn.setOnClickListener(v -> addSpaceDialog());
+                  LinearLayout.LayoutParams addLp = new LinearLayout.LayoutParams(0, Ui.dp(this, 46), 1f);
+                  addLp.setMarginEnd(Ui.dp(this, 8));
+                  row.addView(addBtn, addLp);
+                  removeBtn = Ui.button(this, "🗑 حذف", 0xFFFDECEC, Ui.ERR, 12);
+                  removeBtn.setTextSize(14);
+                  removeBtn.setVisibility(View.GONE);
+                  removeBtn.setOnClickListener(v -> removeSelectedSpace());
+                  row.addView(removeBtn, new LinearLayout.LayoutParams(0, Ui.dp(this, 46), 1f));
+                  c2.addView(row, Ui.lp(this, MATCH, WRAP, 10));
+                  content.addView(c2, Ui.lp(this, MATCH, WRAP, 14));
+
+                  // ---- card 3: motion settings
+                  LinearLayout c3 = Ui.card(this);
+                  c3.addView(Ui.text(this, "٣  صف الحركة", 16, Ui.TEXT, true));
                   promptEdit = new EditText(this);
-                  promptEdit.setHint("وصف الحركة (بالإنجليزية أفضل)");
                   promptEdit.setText(DEFAULT_PROMPT);
-                  promptEdit.setMinLines(2);
-                  root.addView(promptEdit);
+                  promptEdit.setMinLines(3);
+                  promptEdit.setGravity(Gravity.TOP | Gravity.START);
+                  promptEdit.setTextColor(Ui.TEXT);
+                  promptEdit.setTextSize(15);
+                  promptEdit.setBackground(Ui.rect(this, Ui.BG, 12, Ui.BORDER, 1));
+                  promptEdit.setPadding(Ui.dp(this, 12), Ui.dp(this, 10), Ui.dp(this, 12), Ui.dp(this, 10));
+                  promptEdit.setTextDirection(View.TEXT_DIRECTION_FIRST_STRONG);
+                  c3.addView(promptEdit, Ui.lp(this, MATCH, WRAP, 10));
 
-                  durationLabel = new TextView(this);
-                  durationLabel.setText(durationText(10));
-                  root.addView(durationLabel);
+                  HorizontalScrollView hs = new HorizontalScrollView(this);
+                  hs.setHorizontalScrollBarEnabled(false);
+                  LinearLayout chips = new LinearLayout(this);
+                  chips.setOrientation(LinearLayout.HORIZONTAL);
+                  for (int i = 0; i < CHIP_LABELS.length; i++) {
+                      final String p = CHIP_PROMPTS[i];
+                      TextView chip = Ui.text(this, CHIP_LABELS[i], 13, Ui.PRIMARY, true);
+                      chip.setBackground(Ui.rect(this, Ui.CHIP, 20));
+                      chip.setPadding(Ui.dp(this, 14), Ui.dp(this, 8), Ui.dp(this, 14), Ui.dp(this, 8));
+                      chip.setOnClickListener(v -> promptEdit.setText(p));
+                      LinearLayout.LayoutParams cl = new LinearLayout.LayoutParams(WRAP, WRAP);
+                      cl.setMarginEnd(Ui.dp(this, 8));
+                      chips.addView(chip, cl);
+                  }
+                  hs.addView(chips);
+                  c3.addView(hs, Ui.lp(this, MATCH, WRAP, 10));
 
+                  durationLabel = Ui.text(this, durationText(10), 14, Ui.TEXT, false);
+                  c3.addView(durationLabel, Ui.lp(this, MATCH, WRAP, 14));
                   durationSeek = new SeekBar(this);
                   durationSeek.setMax(30);
                   durationSeek.setProgress(10);
+                  durationSeek.setProgressTintList(ColorStateList.valueOf(Ui.PRIMARY));
+                  durationSeek.setThumbTintList(ColorStateList.valueOf(Ui.PRIMARY));
                   durationSeek.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
                       @Override
                       public void onProgressChanged(SeekBar s, int p, boolean fromUser) {
                           durationLabel.setText(durationText(p));
                       }
+
                       @Override
                       public void onStartTrackingTouch(SeekBar s) { }
+
                       @Override
                       public void onStopTrackingTouch(SeekBar s) { }
                   });
-                  root.addView(durationSeek);
+                  c3.addView(durationSeek, Ui.lp(this, MATCH, WRAP, 4));
 
+                  // advanced
+                  final LinearLayout advBox = new LinearLayout(this);
+                  advBox.setOrientation(LinearLayout.VERTICAL);
+                  advBox.setVisibility(View.GONE);
                   tokenEdit = new EditText(this);
-                  tokenEdit.setHint("مفتاح Hugging Face (اختياري، يزيد الحصة المجانية)");
+                  tokenEdit.setHint("مفتاح Hugging Face (اختياري)");
                   tokenEdit.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
                   tokenEdit.setText(prefs.getString("token", ""));
-                  root.addView(tokenEdit);
+                  tokenEdit.setTextSize(14);
+                  tokenEdit.setBackground(Ui.rect(this, Ui.BG, 12, Ui.BORDER, 1));
+                  tokenEdit.setPadding(Ui.dp(this, 12), Ui.dp(this, 10), Ui.dp(this, 12), Ui.dp(this, 10));
+                  advBox.addView(tokenEdit, Ui.lp(this, MATCH, WRAP, 6));
+                  advBox.addView(Ui.text(this, "المفتاح يزيد حصتك اليومية المجانية، ويُحفظ داخل هاتفك فقط.",
+                          12, Ui.MUTED, false), Ui.lp(this, MATCH, WRAP, 4));
+                  final TextView advToggle = Ui.text(this, "⚙️ إعدادات متقدمة ▾", 13, Ui.PRIMARY, true);
+                  advToggle.setOnClickListener(v -> {
+                      boolean show = advBox.getVisibility() != View.VISIBLE;
+                      advBox.setVisibility(show ? View.VISIBLE : View.GONE);
+                      advToggle.setText(show ? "⚙️ إعدادات متقدمة ▴" : "⚙️ إعدادات متقدمة ▾");
+                  });
+                  c3.addView(advToggle, Ui.lp(this, WRAP, WRAP, 14));
+                  c3.addView(advBox, new LinearLayout.LayoutParams(MATCH, WRAP));
+                  content.addView(c3, Ui.lp(this, MATCH, WRAP, 14));
 
-                  genBtn = new Button(this);
-                  genBtn.setText("2) ولّد الفيديو");
+                  // ---- generate button
+                  genBtn = Ui.button(this, "✨ ولّد الفيديو", Ui.PRIMARY, 0xFFFFFFFF, 16);
                   genBtn.setOnClickListener(v -> generate());
-                  root.addView(genBtn);
+                  content.addView(genBtn, Ui.lp(this, MATCH, Ui.dp(this, 58), 18));
 
-                  progress = new ProgressBar(this);
-                  progress.setVisibility(View.GONE);
-                  root.addView(progress);
+                  // ---- status card
+                  statusCard = Ui.card(this);
+                  statusCard.setVisibility(View.GONE);
+                  statusText = Ui.text(this, "", 14, Ui.TEXT, false);
+                  statusCard.addView(statusText);
+                  timerText = Ui.text(this, "00:00", 22, Ui.PRIMARY, true);
+                  statusCard.addView(timerText, Ui.lp(this, WRAP, WRAP, 6));
+                  progress = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+                  progress.setIndeterminate(true);
+                  progress.setIndeterminateTintList(ColorStateList.valueOf(Ui.PRIMARY));
+                  statusCard.addView(progress, Ui.lp(this, MATCH, WRAP, 8));
+                  content.addView(statusCard, Ui.lp(this, MATCH, WRAP, 14));
 
-                  statusText = new TextView(this);
-                  statusText.setTextSize(15);
-                  root.addView(statusText);
-
+                  // ---- result card
+                  resultCard = Ui.card(this);
+                  resultCard.setVisibility(View.GONE);
+                  resultCard.addView(Ui.text(this, "🎉 النتيجة", 16, Ui.TEXT, true));
                   videoView = new VideoView(this);
-                  videoView.setVisibility(View.GONE);
-                  root.addView(videoView, new LinearLayout.LayoutParams(
-                          LinearLayout.LayoutParams.MATCH_PARENT, dp(380)));
-
-                  saveBtn = new Button(this);
-                  saveBtn.setText("حفظ في المعرض");
-                  saveBtn.setVisibility(View.GONE);
-                  saveBtn.setOnClickListener(v -> saveVideo());
-                  root.addView(saveBtn);
+                  Ui.clipRound(videoView, Ui.dp(this, 14));
+                  videoView.setOnClickListener(v -> {
+                      if (videoView.isPlaying()) videoView.pause();
+                      else videoView.start();
+                  });
+                  resultCard.addView(videoView, Ui.lp(this, MATCH, Ui.dp(this, 340), 10));
+                  resultCard.addView(Ui.text(this, "اضغط على الفيديو للإيقاف أو التشغيل", 12, Ui.MUTED, false),
+                          Ui.lp(this, WRAP, WRAP, 6));
+                  LinearLayout actions = new LinearLayout(this);
+                  actions.setOrientation(LinearLayout.HORIZONTAL);
+                  Button saveBtn = Ui.button(this, "💾 حفظ", Ui.OK, 0xFFFFFFFF, 14);
+                  saveBtn.setOnClickListener(v -> {
+                      try {
+                          saveToGallery();
+                          toast("تم الحفظ في المعرض (Movies/Img2Video)");
+                      } catch (Exception e) {
+                          toast("فشل الحفظ: " + e.getMessage());
+                      }
+                  });
+                  LinearLayout.LayoutParams sl = new LinearLayout.LayoutParams(0, Ui.dp(this, 50), 1f);
+                  sl.setMarginEnd(Ui.dp(this, 8));
+                  actions.addView(saveBtn, sl);
+                  Button shareBtn = Ui.button(this, "📤 مشاركة", Ui.PRIMARY, 0xFFFFFFFF, 14);
+                  shareBtn.setOnClickListener(v -> shareVideo());
+                  actions.addView(shareBtn, new LinearLayout.LayoutParams(0, Ui.dp(this, 50), 1f));
+                  resultCard.addView(actions, Ui.lp(this, MATCH, WRAP, 12));
+                  content.addView(resultCard, Ui.lp(this, MATCH, WRAP, 14));
 
                   setContentView(sv);
-              }
 
-              private int dp(int v) {
-                  return (int) (v * getResources().getDisplayMetrics().density);
+                  modelSpinner.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+                      @Override
+                      public void onItemSelected(AdapterView<?> parent, View view, int pos, long id) {
+                          onModelSelected(pos);
+                      }
+
+                      @Override
+                      public void onNothingSelected(AdapterView<?> parent) { }
+                  });
+                  int sel = prefs.getInt("sel", 0);
+                  if (sel < 0 || sel >= ids.size()) sel = 0;
+                  modelSpinner.setSelection(sel);
+                  onModelSelected(sel);
               }
 
               private String durationText(int p) {
-                  return "مدة الفيديو: " + (2.0 + p / 10.0) + " ثانية";
+                  return "⏱  مدة الفيديو: " + (2.0 + p / 10.0) + " ثانية";
               }
 
               private void toast(String s) {
                   Toast.makeText(this, s, Toast.LENGTH_LONG).show();
               }
 
-              private void setStatus(final String s) {
-                  runOnUiThread(() -> statusText.setText(s));
+              // ================================================================ models
+
+              private void loadModels() {
+                  for (String[] m : BUILTIN) {
+                      ids.add(m[0]);
+                      titles.add(m[1]);
+                      descs.add(m[2]);
+                  }
+                  String custom = prefs.getString("custom", "");
+                  if (!custom.isEmpty()) {
+                      for (String id : custom.split("\n")) {
+                          String t = id.trim();
+                          if (!t.isEmpty()) {
+                              ids.add(t);
+                              titles.add("➕ " + t);
+                              descs.add("Space أضفته بنفسك");
+                          }
+                      }
+                  }
               }
+
+              private void saveCustom() {
+                  StringBuilder sb = new StringBuilder();
+                  for (int i = BUILTIN.length; i < ids.size(); i++) {
+                      sb.append(ids.get(i)).append("\n");
+                  }
+                  prefs.edit().putString("custom", sb.toString()).apply();
+              }
+
+              private void onModelSelected(int pos) {
+                  if (pos < 0 || pos >= ids.size()) return;
+                  modelDesc.setText(descs.get(pos) + "\nالمصدر: huggingface.co/spaces/" + ids.get(pos));
+                  removeBtn.setVisibility(pos >= BUILTIN.length ? View.VISIBLE : View.GONE);
+                  prefs.edit().putInt("sel", pos).apply();
+              }
+
+              private static String normalizeSpace(String in) {
+                  String s = in.trim();
+                  s = s.replace("https://huggingface.co/spaces/", "").replace("http://huggingface.co/spaces/", "");
+                  int q = s.indexOf('?');
+                  if (q >= 0) s = s.substring(0, q);
+                  while (s.endsWith("/")) s = s.substring(0, s.length() - 1);
+                  String[] parts = s.split("/");
+                  if (parts.length < 2 || parts[0].isEmpty() || parts[1].isEmpty() || parts[0].contains(".")) return null;
+                  return parts[0] + "/" + parts[1];
+              }
+
+              private void addSpaceDialog() {
+                  final EditText in = new EditText(this);
+                  in.setHint("owner/space-name");
+                  in.setSingleLine(true);
+                  in.setTextDirection(View.TEXT_DIRECTION_LTR);
+                  new AlertDialog.Builder(this)
+                          .setTitle("إضافة Space من Hugging Face")
+                          .setMessage("الصق اسم الـ Space (مثل owner/name) أو رابط صفحته. يجب أن يكون لتحويل "
+                                  + "صورة إلى فيديو، وبواجهة Gradio.")
+                          .setView(in)
+                          .setPositiveButton("إضافة", (d, w) -> {
+                              String id = normalizeSpace(in.getText().toString());
+                              if (id == null) {
+                                  toast("الاسم غير صالح. اكتب owner/name");
+                                  return;
+                              }
+                              for (int i = 0; i < ids.size(); i++) {
+                                  if (ids.get(i).equalsIgnoreCase(id)) {
+                                      modelSpinner.setSelection(i);
+                                      return;
+                                  }
+                              }
+                              ids.add(id);
+                              titles.add("➕ " + id);
+                              descs.add("Space أضفته بنفسك");
+                              saveCustom();
+                              adapter.notifyDataSetChanged();
+                              modelSpinner.setSelection(ids.size() - 1);
+                          })
+                          .setNegativeButton("إلغاء", null)
+                          .show();
+              }
+
+              private void removeSelectedSpace() {
+                  int pos = modelSpinner.getSelectedItemPosition();
+                  if (pos < BUILTIN.length || pos >= ids.size()) return;
+                  ids.remove(pos);
+                  titles.remove(pos);
+                  descs.remove(pos);
+                  saveCustom();
+                  adapter.notifyDataSetChanged();
+                  modelSpinner.setSelection(0);
+                  onModelSelected(0);
+              }
+
+              // ================================================================ image
 
               private void pickImage() {
                   Intent i = new Intent(Intent.ACTION_GET_CONTENT);
@@ -334,7 +648,9 @@ jobs:
                           if (ori == ExifInterface.ORIENTATION_ROTATE_90) rot = 90;
                           else if (ori == ExifInterface.ORIENTATION_ROTATE_180) rot = 180;
                           else if (ori == ExifInterface.ORIENTATION_ROTATE_270) rot = 270;
-                      } catch (Exception ignored) { }
+                      } catch (Exception ignored) {
+                          // no orientation info
+                      }
 
                       Matrix m = new Matrix();
                       if (rot != 0) m.postRotate(rot);
@@ -346,10 +662,43 @@ jobs:
                       out.compress(Bitmap.CompressFormat.JPEG, 90, bo);
                       imageBytes = bo.toByteArray();
                       preview.setImageBitmap(out);
-                      setStatus("تم اختيار الصورة. اضغط ولّد الفيديو.");
+                      preview.setVisibility(View.VISIBLE);
+                      placeholder.setVisibility(View.GONE);
                   } catch (Exception e) {
-                      setStatus("فشل تحميل الصورة: " + e.getMessage());
+                      toast("فشل تحميل الصورة: " + e.getMessage());
                   }
+              }
+
+              // ================================================================ generation
+
+              private void setStatus(final String s) {
+                  runOnUiThread(() -> {
+                      statusText.setTextColor(Ui.TEXT);
+                      statusText.setText(s);
+                  });
+              }
+
+              private void setError(final String s) {
+                  runOnUiThread(() -> {
+                      statusText.setTextColor(Ui.ERR);
+                      statusText.setText(s);
+                  });
+              }
+
+              private void setBusy(final boolean busy) {
+                  runOnUiThread(() -> {
+                      genBtn.setEnabled(!busy);
+                      genBtn.setAlpha(busy ? 0.5f : 1f);
+                      progress.setVisibility(busy ? View.VISIBLE : View.GONE);
+                      if (busy) {
+                          statusCard.setVisibility(View.VISIBLE);
+                          genStart = System.currentTimeMillis();
+                          handler.removeCallbacks(ticker);
+                          handler.post(ticker);
+                      } else {
+                          handler.removeCallbacks(ticker);
+                      }
+                  });
               }
 
               private void generate() {
@@ -358,47 +707,164 @@ jobs:
                       toast("اختر صورة أولًا");
                       return;
                   }
+                  int pos = modelSpinner.getSelectedItemPosition();
+                  if (pos < 0 || pos >= ids.size()) return;
+                  final String spaceId = ids.get(pos);
                   String p = promptEdit.getText().toString().trim();
                   final String prompt = p.isEmpty() ? DEFAULT_PROMPT : p;
                   final double duration = 2.0 + durationSeek.getProgress() / 10.0;
                   final String token = tokenEdit.getText().toString().trim();
                   prefs.edit().putString("token", token).apply();
 
-                  genBtn.setEnabled(false);
-                  saveBtn.setVisibility(View.GONE);
-                  videoView.setVisibility(View.GONE);
-                  progress.setVisibility(View.VISIBLE);
-                  setStatus("جارٍ رفع الصورة...");
+                  resultCard.setVisibility(View.GONE);
+                  savedUri = null;
+                  setStatus("١/٤  جارٍ الاتصال بالنموذج...");
+                  setBusy(true);
 
                   new Thread(() -> {
                       try {
-                          String uploaded = upload(img, token);
-                          setStatus("تم الرفع. في انتظار الخدمة المجانية (قد يطول الانتظار)...");
-                          String eventId = submit(uploaded, prompt, duration, token);
-                          String result = waitResult(eventId, token);
-                          String url = extractUrl(result);
-                          setStatus("جارٍ تنزيل الفيديو...");
-                          final File f = download(url, token);
+                          GradioClient g = new GradioClient(spaceId, token);
+                          g.loadEndpoint(this::setStatus);
+                          setStatus("٢/٤  جارٍ رفع الصورة...");
+                          String uploaded = g.upload(img);
+                          setStatus("٣/٤  تم الرفع. في انتظار الخدمة المجانية (قد يطول الانتظار)...");
+                          String eventId = g.submit(uploaded, prompt, duration);
+                          String result = g.waitResult(eventId, this::setStatus);
+                          setStatus("٤/٤  جارٍ تنزيل الفيديو...");
+                          final File f = g.download(g.extractVideoUrl(result), new File(getCacheDir(), "result.mp4"));
                           resultFile = f;
                           runOnUiThread(() -> showVideo(f));
                       } catch (Exception e) {
-                          setStatus("فشل: " + e.getMessage());
+                          setError("تعذّر التوليد:\n" + e.getMessage());
                       } finally {
-                          runOnUiThread(() -> {
-                              genBtn.setEnabled(true);
-                              progress.setVisibility(View.GONE);
-                          });
+                          setBusy(false);
                       }
                   }).start();
               }
 
-              private HttpURLConnection open(String url, String method, String token) throws IOException {
+              private void showVideo(File f) {
+                  resultCard.setVisibility(View.VISIBLE);
+                  videoView.setVideoPath(f.getAbsolutePath());
+                  videoView.setOnPreparedListener(mp -> {
+                      mp.setLooping(true);
+                      videoView.start();
+                  });
+                  statusText.setTextColor(Ui.OK);
+                  statusText.setText("✅ تم! الفيديو جاهز.");
+              }
+
+              // ================================================================ save / share
+
+              private Uri saveToGallery() throws Exception {
+                  if (savedUri != null) return savedUri;
+                  if (resultFile == null) throw new IOException("لا يوجد فيديو");
+                  ContentValues v = new ContentValues();
+                  v.put(MediaStore.Video.Media.DISPLAY_NAME, "img2video_" + System.currentTimeMillis() + ".mp4");
+                  v.put(MediaStore.Video.Media.MIME_TYPE, "video/mp4");
+                  v.put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/Img2Video");
+                  v.put(MediaStore.Video.Media.IS_PENDING, 1);
+                  Uri u = getContentResolver().insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, v);
+                  if (u == null) throw new IOException("تعذر إنشاء الملف");
+                  try (OutputStream os = getContentResolver().openOutputStream(u);
+                       InputStream in = new FileInputStream(resultFile)) {
+                      byte[] buf = new byte[16384];
+                      int n;
+                      while ((n = in.read(buf)) > 0) os.write(buf, 0, n);
+                  }
+                  ContentValues done = new ContentValues();
+                  done.put(MediaStore.Video.Media.IS_PENDING, 0);
+                  getContentResolver().update(u, done, null, null);
+                  savedUri = u;
+                  return u;
+              }
+
+              private void shareVideo() {
+                  try {
+                      Uri u = saveToGallery();
+                      Intent s = new Intent(Intent.ACTION_SEND);
+                      s.setType("video/mp4");
+                      s.putExtra(Intent.EXTRA_STREAM, u);
+                      s.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                      startActivity(Intent.createChooser(s, "مشاركة الفيديو"));
+                  } catch (Exception e) {
+                      toast("تعذرت المشاركة: " + e.getMessage());
+                  }
+              }
+          }
+          EOF
+
+          cat > app-project/app/src/main/java/com/img2video/app/GradioClient.java <<'EOF'
+          package com.img2video.app;
+
+          import org.json.JSONArray;
+          import org.json.JSONObject;
+
+          import java.io.BufferedReader;
+          import java.io.ByteArrayOutputStream;
+          import java.io.File;
+          import java.io.FileOutputStream;
+          import java.io.IOException;
+          import java.io.InputStream;
+          import java.io.InputStreamReader;
+          import java.io.OutputStream;
+          import java.net.HttpURLConnection;
+          import java.net.URL;
+          import java.net.UnknownHostException;
+          import java.nio.charset.StandardCharsets;
+          import java.util.ArrayList;
+          import java.util.Iterator;
+          import java.util.List;
+          import java.util.Locale;
+
+          /** Talks to any Gradio Space that accepts an image and returns a video. */
+          final class GradioClient {
+
+              interface Listener {
+                  void onStatus(String s);
+              }
+
+              static final class Param {
+                  String label = "";
+                  String name = "";
+                  String component = "";
+                  boolean hasDefault;
+                  Object def;
+                  Object example;
+              }
+
+              static final class Endpoint {
+                  String name;
+                  final List<Param> params = new ArrayList<>();
+                  boolean returnsVideo;
+              }
+
+              private static final String[] PREFIXES = {"/gradio_api", ""};
+
+              final String host;
+              private final String token;
+              private String prefix = "/gradio_api";
+              private Endpoint endpoint;
+
+              GradioClient(String spaceId, String token) {
+                  this.host = hostFor(spaceId);
+                  this.token = token;
+              }
+
+              static String hostFor(String spaceId) {
+                  String s = spaceId.trim().toLowerCase(Locale.ROOT);
+                  s = s.replace("/", "-").replace("_", "-").replace(".", "-");
+                  return "https://" + s + ".hf.space";
+              }
+
+              // ---------------------------------------------------------------- HTTP helpers
+
+              private HttpURLConnection open(String url, String method) throws IOException {
                   HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
                   c.setRequestMethod(method);
                   c.setConnectTimeout(30000);
                   c.setReadTimeout(120000);
-                  c.setRequestProperty("User-Agent", "Img2VideoApp/1.0");
-                  if (token != null && !token.isEmpty()) {
+                  c.setRequestProperty("User-Agent", "Img2VideoApp/2.0");
+                  if (token != null && !token.isEmpty() && url.startsWith(host)) {
                       c.setRequestProperty("Authorization", "Bearer " + token);
                   }
                   return c;
@@ -423,59 +889,158 @@ jobs:
                   return s.length() > 300 ? s.substring(0, 300) : s;
               }
 
-              private String upload(byte[] data, String token) throws Exception {
-                  String boundary = "----i2v" + System.currentTimeMillis();
-                  String[] prefixes = {"/gradio_api", ""};
-                  for (String p : prefixes) {
-                      ByteArrayOutputStream body = new ByteArrayOutputStream();
-                      body.write(("--" + boundary + "\r\n"
-                              + "Content-Disposition: form-data; name=\"files\"; filename=\"image.jpg\"\r\n"
-                              + "Content-Type: image/jpeg\r\n\r\n").getBytes(StandardCharsets.UTF_8));
-                      body.write(data);
-                      body.write(("\r\n--" + boundary + "--\r\n").getBytes(StandardCharsets.UTF_8));
+              // ---------------------------------------------------------------- API description
 
-                      HttpURLConnection c = open(HOST + p + "/upload", "POST", token);
-                      c.setDoOutput(true);
-                      c.setRequestProperty("Content-Type", "multipart/form-data; boundary=" + boundary);
-                      c.setFixedLengthStreamingMode(body.size());
-                      try (OutputStream os = c.getOutputStream()) {
-                          body.writeTo(os);
+              void loadEndpoint(Listener l) throws Exception {
+                  JSONObject info = null;
+                  for (int attempt = 0; attempt < 7 && info == null; attempt++) {
+                      if (attempt > 0) {
+                          l.onStatus("الـ Space يستيقظ أو يبدأ التشغيل... محاولة " + (attempt + 1));
+                          Thread.sleep(10000);
                       }
-                      int code = c.getResponseCode();
-                      String resp = readAll(code >= 400 ? c.getErrorStream() : c.getInputStream());
-                      if (code == 404 && p.length() > 0) continue;
-                      if (code >= 400) {
-                          throw new IOException("رفع الصورة فشل (HTTP " + code + "): " + clip(resp));
+                      for (String p : PREFIXES) {
+                          int code = -1;
+                          String text = "";
+                          try {
+                              HttpURLConnection c = open(host + p + "/info", "GET");
+                              code = c.getResponseCode();
+                              text = readAll(code >= 400 ? c.getErrorStream() : c.getInputStream());
+                          } catch (UnknownHostException e) {
+                              throw new IOException("لم أجد هذا الـ Space. تحقق من الاسم.");
+                          } catch (IOException e) {
+                              code = -1;
+                          }
+                          if (code == 200 && text.trim().startsWith("{")) {
+                              info = new JSONObject(text);
+                              prefix = p;
+                              break;
+                          }
                       }
-                      prefix = p;
-                      return new JSONArray(resp).getString(0);
                   }
-                  throw new IOException("تعذر الوصول إلى الخدمة (قد تكون متوقفة).");
+                  if (info == null) {
+                      throw new IOException("الـ Space لا يستجيب الآن (قد يكون نائمًا أو معطّلًا أو لا يستخدم Gradio). "
+                              + "جرّب لاحقًا أو اختر نموذجًا آخر.");
+                  }
+
+                  JSONObject named = info.optJSONObject("named_endpoints");
+                  if (named == null) throw new IOException("لم أستطع قراءة واجهة هذا الـ Space.");
+
+                  Endpoint best = null;
+                  int bestScore = -1;
+                  Iterator<String> it = named.keys();
+                  while (it.hasNext()) {
+                      String key = it.next();
+                      JSONObject ep = named.optJSONObject(key);
+                      if (ep == null) continue;
+                      JSONArray ps = ep.optJSONArray("parameters");
+                      if (ps == null) continue;
+
+                      Endpoint e = new Endpoint();
+                      e.name = key.startsWith("/") ? key.substring(1) : key;
+                      boolean hasImage = false;
+                      for (int i = 0; i < ps.length(); i++) {
+                          JSONObject po = ps.getJSONObject(i);
+                          Param p = new Param();
+                          p.label = po.optString("label", "");
+                          p.name = po.optString("parameter_name", "");
+                          p.component = po.optString("component", "");
+                          p.hasDefault = po.optBoolean("parameter_has_default", false);
+                          p.def = po.has("parameter_default") ? po.get("parameter_default") : null;
+                          p.example = po.has("example_input") ? po.get("example_input") : null;
+                          e.params.add(p);
+                          if (p.component.equalsIgnoreCase("image")) hasImage = true;
+                      }
+                      JSONArray rs = ep.optJSONArray("returns");
+                      if (rs != null) {
+                          for (int i = 0; i < rs.length(); i++) {
+                              JSONObject ro = rs.optJSONObject(i);
+                              if (ro != null && ro.optString("component", "").equalsIgnoreCase("video")) {
+                                  e.returnsVideo = true;
+                              }
+                          }
+                      }
+                      if (!hasImage) continue;
+                      int score = 2 + (e.returnsVideo ? 3 : 0);
+                      String low = e.name.toLowerCase(Locale.ROOT);
+                      if (low.contains("generate") || low.contains("video")) score += 1;
+                      if (score > bestScore) {
+                          bestScore = score;
+                          best = e;
+                      }
+                  }
+                  if (best == null) {
+                      throw new IOException("هذا الـ Space لا يقبل صورة كمدخل، فلا يصلح لهذا التطبيق.");
+                  }
+                  endpoint = best;
               }
 
-              private String submit(String uploaded, String prompt, double duration, String token) throws Exception {
-                  JSONObject meta = new JSONObject();
-                  meta.put("_type", "gradio.FileData");
-                  JSONObject fd = new JSONObject();
-                  fd.put("path", uploaded);
-                  fd.put("meta", meta);
-
+              private JSONArray buildData(String uploadedPath, String prompt, double duration) throws Exception {
                   JSONArray data = new JSONArray();
-                  data.put(fd);          // input_image
-                  data.put(prompt);      // prompt
-                  data.put(4);           // steps
-                  data.put("");          // negative_prompt
-                  data.put(duration);    // duration_seconds
-                  data.put(1);           // guidance_scale
-                  data.put(1);           // guidance_scale_2
-                  data.put(42);          // seed
-                  data.put(true);        // randomize_seed
+                  boolean imgUsed = false;
+                  boolean promptUsed = false;
+                  for (Param p : endpoint.params) {
+                      String lbl = (p.label + " " + p.name).toLowerCase(Locale.ROOT);
+                      String comp = p.component.toLowerCase(Locale.ROOT);
+                      if (comp.equals("image") && !imgUsed) {
+                          JSONObject meta = new JSONObject();
+                          meta.put("_type", "gradio.FileData");
+                          JSONObject fd = new JSONObject();
+                          fd.put("path", uploadedPath);
+                          fd.put("meta", meta);
+                          data.put(fd);
+                          imgUsed = true;
+                      } else if (comp.equals("textbox") && !lbl.contains("negative") && !promptUsed) {
+                          data.put(prompt);
+                          promptUsed = true;
+                      } else if (comp.equals("textbox") && lbl.contains("negative") && !p.hasDefault) {
+                          data.put("");
+                      } else if (lbl.contains("duration")) {
+                          data.put(duration);
+                      } else if (comp.equals("checkbox") && lbl.contains("random")) {
+                          data.put(true);
+                      } else if (p.hasDefault) {
+                          data.put(p.def == null ? JSONObject.NULL : p.def);
+                      } else if (p.example != null) {
+                          data.put(p.example);
+                      } else {
+                          data.put(JSONObject.NULL);
+                      }
+                  }
+                  return data;
+              }
 
+              // ---------------------------------------------------------------- steps
+
+              String upload(byte[] data) throws Exception {
+                  String boundary = "----i2v" + System.currentTimeMillis();
+                  ByteArrayOutputStream body = new ByteArrayOutputStream();
+                  body.write(("--" + boundary + "\r\n"
+                          + "Content-Disposition: form-data; name=\"files\"; filename=\"image.jpg\"\r\n"
+                          + "Content-Type: image/jpeg\r\n\r\n").getBytes(StandardCharsets.UTF_8));
+                  body.write(data);
+                  body.write(("\r\n--" + boundary + "--\r\n").getBytes(StandardCharsets.UTF_8));
+
+                  HttpURLConnection c = open(host + prefix + "/upload", "POST");
+                  c.setDoOutput(true);
+                  c.setRequestProperty("Content-Type", "multipart/form-data; boundary=" + boundary);
+                  c.setFixedLengthStreamingMode(body.size());
+                  try (OutputStream os = c.getOutputStream()) {
+                      body.writeTo(os);
+                  }
+                  int code = c.getResponseCode();
+                  String resp = readAll(code >= 400 ? c.getErrorStream() : c.getInputStream());
+                  if (code >= 400) {
+                      throw new IOException("رفع الصورة فشل (HTTP " + code + "): " + clip(resp));
+                  }
+                  return new JSONArray(resp).getString(0);
+              }
+
+              String submit(String uploadedPath, String prompt, double duration) throws Exception {
                   JSONObject req = new JSONObject();
-                  req.put("data", data);
+                  req.put("data", buildData(uploadedPath, prompt, duration));
                   byte[] body = req.toString().getBytes(StandardCharsets.UTF_8);
 
-                  HttpURLConnection c = open(HOST + prefix + "/call/" + API_NAME, "POST", token);
+                  HttpURLConnection c = open(host + prefix + "/call/" + endpoint.name, "POST");
                   c.setDoOutput(true);
                   c.setRequestProperty("Content-Type", "application/json");
                   c.setFixedLengthStreamingMode(body.length);
@@ -490,59 +1055,79 @@ jobs:
                   return new JSONObject(resp).getString("event_id");
               }
 
-              private String waitResult(String eventId, String token) throws Exception {
-                  HttpURLConnection c = open(HOST + prefix + "/call/" + API_NAME + "/" + eventId, "GET", token);
-                  c.setReadTimeout(15 * 60 * 1000);
+              String waitResult(String eventId, Listener l) throws Exception {
+                  HttpURLConnection c = open(host + prefix + "/call/" + endpoint.name + "/" + eventId, "GET");
+                  c.setReadTimeout(20 * 60 * 1000);
+                  c.setRequestProperty("Accept", "text/event-stream");
                   int code = c.getResponseCode();
                   if (code >= 400) {
-                      throw new IOException("تعذر قراءة النتيجة (HTTP " + code + "): "
-                              + clip(readAll(c.getErrorStream())));
+                      throw new IOException("تعذر قراءة النتيجة (HTTP " + code + "): " + clip(readAll(c.getErrorStream())));
                   }
-                  long t0 = System.currentTimeMillis();
-                  BufferedReader br = new BufferedReader(
-                          new InputStreamReader(c.getInputStream(), StandardCharsets.UTF_8));
+                  BufferedReader br = new BufferedReader(new InputStreamReader(c.getInputStream(), StandardCharsets.UTF_8));
                   String line;
                   String event = null;
                   while ((line = br.readLine()) != null) {
                       if (line.startsWith("event:")) {
                           event = line.substring(6).trim();
-                          long secs = (System.currentTimeMillis() - t0) / 1000;
-                          setStatus("جارٍ التوليد... مرّت " + secs + " ثانية");
+                          if (!"complete".equals(event) && !"error".equals(event)) {
+                              l.onStatus("النموذج يعمل الآن... (قد يستغرق دقيقة أو أكثر)");
+                          }
                       } else if (line.startsWith("data:")) {
                           String d = line.substring(5).trim();
                           if ("complete".equals(event)) return d;
                           if ("error".equals(event)) {
-                              if (d.equals("null") || d.isEmpty()) {
-                                  throw new IOException("الخدمة أعادت خطأ دون تفاصيل. قد تكون الحصة المجانية "
-                                          + "انتهت أو الخدمة مشغولة. جرّب لاحقًا أو أضف مفتاح Hugging Face.");
+                              String low = d.toLowerCase(Locale.ROOT);
+                              if (low.contains("quota")) {
+                                  throw new IOException("انتهت حصتك المجانية من هذه الخدمة. أضف مفتاح Hugging Face "
+                                          + "في الإعدادات المتقدمة، أو جرّب لاحقًا، أو اختر نموذجًا آخر.\n" + clip(d));
                               }
-                              throw new IOException("الخدمة أعادت خطأ: " + clip(d));
+                              if (d.equals("null") || d.isEmpty()) {
+                                  throw new IOException("النموذج أعاد خطأ دون تفاصيل. قد تكون الخدمة مشغولة "
+                                          + "أو الحصة المجانية انتهت، أو أن هذا النموذج يحتاج مدخلات لا يدعمها التطبيق.");
+                              }
+                              throw new IOException("النموذج أعاد خطأ: " + clip(d));
                           }
                       }
                   }
                   throw new IOException("انتهى الاتصال دون نتيجة.");
               }
 
-              private String extractUrl(String data) throws Exception {
+              String extractVideoUrl(String data) throws Exception {
                   JSONArray res = new JSONArray(data);
-                  Object first = res.get(0);
-                  if (first instanceof JSONObject) {
-                      JSONObject o = (JSONObject) first;
-                      if (o.has("video") && !o.isNull("video")) o = o.getJSONObject("video");
-                      String url = o.isNull("url") ? "" : o.optString("url", "");
-                      if (url.isEmpty() || url.equals("null")) {
-                          url = HOST + prefix + "/file=" + o.getString("path");
-                      }
-                      return url;
-                  } else if (first instanceof String) {
-                      return HOST + prefix + "/file=" + first;
+                  String fallback = null;
+                  for (int i = 0; i < res.length(); i++) {
+                      String u = urlFrom(res.get(i));
+                      if (u == null) continue;
+                      String low = u.toLowerCase(Locale.ROOT);
+                      if (low.contains(".mp4") || low.contains(".webm") || low.contains(".mov")) return u;
+                      if (fallback == null) fallback = u;
                   }
-                  throw new IOException("صيغة النتيجة غير متوقعة: " + clip(data));
+                  if (fallback != null) return fallback;
+                  throw new IOException("لم أجد فيديو في النتيجة: " + clip(data));
               }
 
-              private File download(String url, String token) throws Exception {
-                  File out = new File(getCacheDir(), "result.mp4");
-                  HttpURLConnection c = open(url, "GET", url.startsWith(HOST) ? token : null);
+              private String urlFrom(Object o) {
+                  try {
+                      if (o instanceof JSONObject) {
+                          JSONObject j = (JSONObject) o;
+                          if (j.has("video") && !j.isNull("video")) return urlFrom(j.get("video"));
+                          String url = j.isNull("url") ? "" : j.optString("url", "");
+                          if (!url.isEmpty() && !url.equals("null")) return url;
+                          String path = j.isNull("path") ? "" : j.optString("path", "");
+                          if (!path.isEmpty() && !path.equals("null")) return host + prefix + "/file=" + path;
+                      } else if (o instanceof String) {
+                          String s = (String) o;
+                          if (s.startsWith("http")) return s;
+                          if (s.startsWith("/")) return host + prefix + "/file=" + s;
+                      }
+                  } catch (Exception ignored) {
+                      // fall through
+                  }
+                  return null;
+              }
+
+              File download(String url, File out) throws Exception {
+                  HttpURLConnection c = open(url, "GET");
                   c.setReadTimeout(180000);
                   int code = c.getResponseCode();
                   if (code >= 400) {
@@ -553,42 +1138,100 @@ jobs:
                   }
                   return out;
               }
+          }
+          EOF
 
-              private void showVideo(File f) {
-                  videoView.setVisibility(View.VISIBLE);
-                  MediaController mc = new MediaController(this);
-                  mc.setAnchorView(videoView);
-                  videoView.setMediaController(mc);
-                  videoView.setVideoPath(f.getAbsolutePath());
-                  videoView.setOnPreparedListener(mp -> {
-                      mp.setLooping(true);
-                      videoView.start();
-                  });
-                  saveBtn.setVisibility(View.VISIBLE);
-                  setStatus("تم! الفيديو جاهز.");
+          cat > app-project/app/src/main/java/com/img2video/app/Ui.java <<'EOF'
+          package com.img2video.app;
+
+          import android.content.Context;
+          import android.content.res.ColorStateList;
+          import android.graphics.Outline;
+          import android.graphics.Typeface;
+          import android.graphics.drawable.GradientDrawable;
+          import android.graphics.drawable.RippleDrawable;
+          import android.view.View;
+          import android.view.ViewOutlineProvider;
+          import android.widget.Button;
+          import android.widget.LinearLayout;
+          import android.widget.TextView;
+
+          final class Ui {
+              static final int BG = 0xFFF4F5FB;
+              static final int PRIMARY = 0xFF5B5BD6;
+              static final int TEXT = 0xFF1B1B2F;
+              static final int MUTED = 0xFF6B6F85;
+              static final int CARD = 0xFFFFFFFF;
+              static final int BORDER = 0xFFE3E5F0;
+              static final int CHIP = 0xFFEEF0FF;
+              static final int OK = 0xFF1FA971;
+              static final int ERR = 0xFFD64545;
+
+              private Ui() { }
+
+              static int dp(Context c, float v) {
+                  return Math.round(v * c.getResources().getDisplayMetrics().density);
               }
 
-              private void saveVideo() {
-                  if (resultFile == null) return;
-                  try {
-                      ContentValues v = new ContentValues();
-                      v.put(MediaStore.Video.Media.DISPLAY_NAME, "img2video_" + System.currentTimeMillis() + ".mp4");
-                      v.put(MediaStore.Video.Media.MIME_TYPE, "video/mp4");
-                      v.put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/Img2Video");
-                      v.put(MediaStore.Video.Media.IS_PENDING, 1);
-                      Uri u = getContentResolver().insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, v);
-                      if (u == null) throw new IOException("تعذر إنشاء الملف");
-                      try (OutputStream os = getContentResolver().openOutputStream(u);
-                           InputStream in = new FileInputStream(resultFile)) {
-                          copy(in, os);
+              static GradientDrawable rect(Context c, int fill, float radiusDp) {
+                  GradientDrawable g = new GradientDrawable();
+                  g.setColor(fill);
+                  g.setCornerRadius(dp(c, radiusDp));
+                  return g;
+              }
+
+              static GradientDrawable rect(Context c, int fill, float radiusDp, int strokeColor, float strokeDp) {
+                  GradientDrawable g = rect(c, fill, radiusDp);
+                  g.setStroke(Math.max(1, dp(c, strokeDp)), strokeColor);
+                  return g;
+              }
+
+              /** Layout params where w and h are in pixels and the top margin is in dp. */
+              static LinearLayout.LayoutParams lp(Context c, int w, int h, float topDp) {
+                  LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(w, h);
+                  p.topMargin = dp(c, topDp);
+                  return p;
+              }
+
+              static LinearLayout card(Context c) {
+                  LinearLayout l = new LinearLayout(c);
+                  l.setOrientation(LinearLayout.VERTICAL);
+                  l.setBackground(rect(c, CARD, 18, BORDER, 1));
+                  l.setPadding(dp(c, 16), dp(c, 16), dp(c, 16), dp(c, 16));
+                  l.setElevation(dp(c, 2));
+                  return l;
+              }
+
+              static TextView text(Context c, String t, float sp, int color, boolean bold) {
+                  TextView v = new TextView(c);
+                  v.setText(t);
+                  v.setTextSize(sp);
+                  v.setTextColor(color);
+                  if (bold) v.setTypeface(null, Typeface.BOLD);
+                  return v;
+              }
+
+              static Button button(Context c, String t, int fill, int textColor, float radiusDp) {
+                  Button b = new Button(c);
+                  b.setText(t);
+                  b.setAllCaps(false);
+                  b.setTextColor(textColor);
+                  b.setTextSize(16);
+                  b.setTypeface(null, Typeface.BOLD);
+                  b.setStateListAnimator(null);
+                  b.setBackground(new RippleDrawable(
+                          ColorStateList.valueOf(0x33000000), rect(c, fill, radiusDp), null));
+                  return b;
+              }
+
+              static void clipRound(View v, final float radiusPx) {
+                  v.setClipToOutline(true);
+                  v.setOutlineProvider(new ViewOutlineProvider() {
+                      @Override
+                      public void getOutline(View view, Outline outline) {
+                          outline.setRoundRect(0, 0, view.getWidth(), view.getHeight(), radiusPx);
                       }
-                      ContentValues done = new ContentValues();
-                      done.put(MediaStore.Video.Media.IS_PENDING, 0);
-                      getContentResolver().update(u, done, null, null);
-                      toast("تم الحفظ في المعرض (Movies/Img2Video)");
-                  } catch (Exception e) {
-                      toast("فشل الحفظ: " + e.getMessage());
-                  }
+                  });
               }
           }
           EOF

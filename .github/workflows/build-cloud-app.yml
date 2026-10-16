@@ -1,0 +1,661 @@
+name: Build Cloud Image-to-Video App
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Create project files
+        run: |
+          mkdir -p app-project/app/src/main/java/com/img2video/app
+          mkdir -p app-project/app/src/main/res/values
+
+          cat > app-project/settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "Img2Video"
+          include ':app'
+          EOF
+
+          cat > app-project/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+          }
+          EOF
+
+          cat > app-project/gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+          android.nonTransitiveRClass=true
+          EOF
+
+          cat > app-project/app/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'com.img2video.app'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId 'com.img2video.app'
+                  minSdk 29
+                  targetSdk 34
+                  versionCode 1
+                  versionName '1.0'
+              }
+
+              buildTypes {
+                  release {
+                      minifyEnabled false
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+
+          tasks.withType(JavaCompile) {
+              options.encoding = 'UTF-8'
+          }
+          EOF
+
+          cat > app-project/app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <application
+                  android:label="@string/app_name"
+                  android:icon="@android:drawable/ic_media_play"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar"
+                  android:supportsRtl="true"
+                  android:allowBackup="false"
+                  android:usesCleartextTraffic="false">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:configChanges="orientation|screenSize|keyboardHidden">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app-project/app/src/main/res/values/strings.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">صورة إلى فيديو</string>
+          </resources>
+          EOF
+
+          cat > app-project/app/src/main/java/com/img2video/app/MainActivity.java <<'EOF'
+          package com.img2video.app;
+
+          import android.app.Activity;
+          import android.content.ContentValues;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          import android.graphics.Bitmap;
+          import android.graphics.BitmapFactory;
+          import android.graphics.Matrix;
+          import android.media.ExifInterface;
+          import android.net.Uri;
+          import android.os.Bundle;
+          import android.provider.MediaStore;
+          import android.text.InputType;
+          import android.view.View;
+          import android.widget.Button;
+          import android.widget.EditText;
+          import android.widget.ImageView;
+          import android.widget.LinearLayout;
+          import android.widget.MediaController;
+          import android.widget.ProgressBar;
+          import android.widget.ScrollView;
+          import android.widget.SeekBar;
+          import android.widget.TextView;
+          import android.widget.Toast;
+          import android.widget.VideoView;
+
+          import org.json.JSONArray;
+          import org.json.JSONObject;
+
+          import java.io.BufferedReader;
+          import java.io.ByteArrayOutputStream;
+          import java.io.File;
+          import java.io.FileInputStream;
+          import java.io.FileOutputStream;
+          import java.io.IOException;
+          import java.io.InputStream;
+          import java.io.InputStreamReader;
+          import java.io.OutputStream;
+          import java.net.HttpURLConnection;
+          import java.net.URL;
+          import java.nio.charset.StandardCharsets;
+
+          public class MainActivity extends Activity {
+              private static final String HOST = "https://zerogpu-aoti-wan2-2-fp8da-aoti-faster.hf.space";
+              private static final String API_NAME = "generate_video";
+              private static final String DEFAULT_PROMPT = "make this image come alive, cinematic motion, smooth animation";
+              private static final int REQ_PICK = 1;
+
+              private ImageView preview;
+              private EditText promptEdit;
+              private EditText tokenEdit;
+              private TextView durationLabel;
+              private TextView statusText;
+              private SeekBar durationSeek;
+              private Button genBtn;
+              private Button saveBtn;
+              private ProgressBar progress;
+              private VideoView videoView;
+              private byte[] imageBytes;
+              private File resultFile;
+              private String prefix = "/gradio_api";
+              private SharedPreferences prefs;
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  prefs = getSharedPreferences("i2v", MODE_PRIVATE);
+
+                  ScrollView sv = new ScrollView(this);
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setPadding(dp(20), dp(40), dp(20), dp(30));
+                  sv.addView(root);
+
+                  TextView title = new TextView(this);
+                  title.setText("تحويل الصورة إلى فيديو");
+                  title.setTextSize(22);
+                  root.addView(title);
+
+                  TextView note = new TextView(this);
+                  note.setText("يعمل عبر خدمة مجانية في السحابة، فقد تنتظر في الطابور، وللخدمة حصة يومية.");
+                  note.setTextSize(13);
+                  root.addView(note);
+
+                  Button pickBtn = new Button(this);
+                  pickBtn.setText("1) اختر صورة");
+                  pickBtn.setOnClickListener(v -> pickImage());
+                  root.addView(pickBtn);
+
+                  preview = new ImageView(this);
+                  preview.setAdjustViewBounds(true);
+                  preview.setScaleType(ImageView.ScaleType.FIT_CENTER);
+                  root.addView(preview, new LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT, dp(220)));
+
+                  promptEdit = new EditText(this);
+                  promptEdit.setHint("وصف الحركة (بالإنجليزية أفضل)");
+                  promptEdit.setText(DEFAULT_PROMPT);
+                  promptEdit.setMinLines(2);
+                  root.addView(promptEdit);
+
+                  durationLabel = new TextView(this);
+                  durationLabel.setText(durationText(10));
+                  root.addView(durationLabel);
+
+                  durationSeek = new SeekBar(this);
+                  durationSeek.setMax(30);
+                  durationSeek.setProgress(10);
+                  durationSeek.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+                      @Override
+                      public void onProgressChanged(SeekBar s, int p, boolean fromUser) {
+                          durationLabel.setText(durationText(p));
+                      }
+                      @Override
+                      public void onStartTrackingTouch(SeekBar s) { }
+                      @Override
+                      public void onStopTrackingTouch(SeekBar s) { }
+                  });
+                  root.addView(durationSeek);
+
+                  tokenEdit = new EditText(this);
+                  tokenEdit.setHint("مفتاح Hugging Face (اختياري، يزيد الحصة المجانية)");
+                  tokenEdit.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+                  tokenEdit.setText(prefs.getString("token", ""));
+                  root.addView(tokenEdit);
+
+                  genBtn = new Button(this);
+                  genBtn.setText("2) ولّد الفيديو");
+                  genBtn.setOnClickListener(v -> generate());
+                  root.addView(genBtn);
+
+                  progress = new ProgressBar(this);
+                  progress.setVisibility(View.GONE);
+                  root.addView(progress);
+
+                  statusText = new TextView(this);
+                  statusText.setTextSize(15);
+                  root.addView(statusText);
+
+                  videoView = new VideoView(this);
+                  videoView.setVisibility(View.GONE);
+                  root.addView(videoView, new LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT, dp(380)));
+
+                  saveBtn = new Button(this);
+                  saveBtn.setText("حفظ في المعرض");
+                  saveBtn.setVisibility(View.GONE);
+                  saveBtn.setOnClickListener(v -> saveVideo());
+                  root.addView(saveBtn);
+
+                  setContentView(sv);
+              }
+
+              private int dp(int v) {
+                  return (int) (v * getResources().getDisplayMetrics().density);
+              }
+
+              private String durationText(int p) {
+                  return "مدة الفيديو: " + (2.0 + p / 10.0) + " ثانية";
+              }
+
+              private void toast(String s) {
+                  Toast.makeText(this, s, Toast.LENGTH_LONG).show();
+              }
+
+              private void setStatus(final String s) {
+                  runOnUiThread(() -> statusText.setText(s));
+              }
+
+              private void pickImage() {
+                  Intent i = new Intent(Intent.ACTION_GET_CONTENT);
+                  i.setType("image/*");
+                  startActivityForResult(Intent.createChooser(i, "اختر صورة"), REQ_PICK);
+              }
+
+              @Override
+              protected void onActivityResult(int req, int res, Intent data) {
+                  super.onActivityResult(req, res, data);
+                  if (req == REQ_PICK && res == RESULT_OK && data != null && data.getData() != null) {
+                      loadImage(data.getData());
+                  }
+              }
+
+              private void loadImage(Uri uri) {
+                  try {
+                      BitmapFactory.Options bounds = new BitmapFactory.Options();
+                      bounds.inJustDecodeBounds = true;
+                      try (InputStream in = getContentResolver().openInputStream(uri)) {
+                          BitmapFactory.decodeStream(in, null, bounds);
+                      }
+                      int maxSide = Math.max(bounds.outWidth, bounds.outHeight);
+                      int sample = 1;
+                      while (maxSide / sample > 2048) sample *= 2;
+
+                      BitmapFactory.Options opts = new BitmapFactory.Options();
+                      opts.inSampleSize = sample;
+                      Bitmap bmp;
+                      try (InputStream in = getContentResolver().openInputStream(uri)) {
+                          bmp = BitmapFactory.decodeStream(in, null, opts);
+                      }
+                      if (bmp == null) throw new IOException("تعذر قراءة الصورة");
+
+                      int rot = 0;
+                      try (InputStream in = getContentResolver().openInputStream(uri)) {
+                          ExifInterface ex = new ExifInterface(in);
+                          int ori = ex.getAttributeInt(ExifInterface.TAG_ORIENTATION,
+                                  ExifInterface.ORIENTATION_NORMAL);
+                          if (ori == ExifInterface.ORIENTATION_ROTATE_90) rot = 90;
+                          else if (ori == ExifInterface.ORIENTATION_ROTATE_180) rot = 180;
+                          else if (ori == ExifInterface.ORIENTATION_ROTATE_270) rot = 270;
+                      } catch (Exception ignored) { }
+
+                      Matrix m = new Matrix();
+                      if (rot != 0) m.postRotate(rot);
+                      float scale = Math.min(1f, 1024f / Math.max(bmp.getWidth(), bmp.getHeight()));
+                      m.postScale(scale, scale);
+                      Bitmap out = Bitmap.createBitmap(bmp, 0, 0, bmp.getWidth(), bmp.getHeight(), m, true);
+
+                      ByteArrayOutputStream bo = new ByteArrayOutputStream();
+                      out.compress(Bitmap.CompressFormat.JPEG, 90, bo);
+                      imageBytes = bo.toByteArray();
+                      preview.setImageBitmap(out);
+                      setStatus("تم اختيار الصورة. اضغط ولّد الفيديو.");
+                  } catch (Exception e) {
+                      setStatus("فشل تحميل الصورة: " + e.getMessage());
+                  }
+              }
+
+              private void generate() {
+                  final byte[] img = imageBytes;
+                  if (img == null) {
+                      toast("اختر صورة أولًا");
+                      return;
+                  }
+                  String p = promptEdit.getText().toString().trim();
+                  final String prompt = p.isEmpty() ? DEFAULT_PROMPT : p;
+                  final double duration = 2.0 + durationSeek.getProgress() / 10.0;
+                  final String token = tokenEdit.getText().toString().trim();
+                  prefs.edit().putString("token", token).apply();
+
+                  genBtn.setEnabled(false);
+                  saveBtn.setVisibility(View.GONE);
+                  videoView.setVisibility(View.GONE);
+                  progress.setVisibility(View.VISIBLE);
+                  setStatus("جارٍ رفع الصورة...");
+
+                  new Thread(() -> {
+                      try {
+                          String uploaded = upload(img, token);
+                          setStatus("تم الرفع. في انتظار الخدمة المجانية (قد يطول الانتظار)...");
+                          String eventId = submit(uploaded, prompt, duration, token);
+                          String result = waitResult(eventId, token);
+                          String url = extractUrl(result);
+                          setStatus("جارٍ تنزيل الفيديو...");
+                          final File f = download(url, token);
+                          resultFile = f;
+                          runOnUiThread(() -> showVideo(f));
+                      } catch (Exception e) {
+                          setStatus("فشل: " + e.getMessage());
+                      } finally {
+                          runOnUiThread(() -> {
+                              genBtn.setEnabled(true);
+                              progress.setVisibility(View.GONE);
+                          });
+                      }
+                  }).start();
+              }
+
+              private HttpURLConnection open(String url, String method, String token) throws IOException {
+                  HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+                  c.setRequestMethod(method);
+                  c.setConnectTimeout(30000);
+                  c.setReadTimeout(120000);
+                  c.setRequestProperty("User-Agent", "Img2VideoApp/1.0");
+                  if (token != null && !token.isEmpty()) {
+                      c.setRequestProperty("Authorization", "Bearer " + token);
+                  }
+                  return c;
+              }
+
+              private static String readAll(InputStream in) throws IOException {
+                  if (in == null) return "";
+                  ByteArrayOutputStream bo = new ByteArrayOutputStream();
+                  byte[] buf = new byte[8192];
+                  int n;
+                  while ((n = in.read(buf)) > 0) bo.write(buf, 0, n);
+                  return new String(bo.toByteArray(), StandardCharsets.UTF_8);
+              }
+
+              private static void copy(InputStream in, OutputStream out) throws IOException {
+                  byte[] buf = new byte[16384];
+                  int n;
+                  while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+              }
+
+              private static String clip(String s) {
+                  return s.length() > 300 ? s.substring(0, 300) : s;
+              }
+
+              private String upload(byte[] data, String token) throws Exception {
+                  String boundary = "----i2v" + System.currentTimeMillis();
+                  String[] prefixes = {"/gradio_api", ""};
+                  for (String p : prefixes) {
+                      ByteArrayOutputStream body = new ByteArrayOutputStream();
+                      body.write(("--" + boundary + "\r\n"
+                              + "Content-Disposition: form-data; name=\"files\"; filename=\"image.jpg\"\r\n"
+                              + "Content-Type: image/jpeg\r\n\r\n").getBytes(StandardCharsets.UTF_8));
+                      body.write(data);
+                      body.write(("\r\n--" + boundary + "--\r\n").getBytes(StandardCharsets.UTF_8));
+
+                      HttpURLConnection c = open(HOST + p + "/upload", "POST", token);
+                      c.setDoOutput(true);
+                      c.setRequestProperty("Content-Type", "multipart/form-data; boundary=" + boundary);
+                      c.setFixedLengthStreamingMode(body.size());
+                      try (OutputStream os = c.getOutputStream()) {
+                          body.writeTo(os);
+                      }
+                      int code = c.getResponseCode();
+                      String resp = readAll(code >= 400 ? c.getErrorStream() : c.getInputStream());
+                      if (code == 404 && p.length() > 0) continue;
+                      if (code >= 400) {
+                          throw new IOException("رفع الصورة فشل (HTTP " + code + "): " + clip(resp));
+                      }
+                      prefix = p;
+                      return new JSONArray(resp).getString(0);
+                  }
+                  throw new IOException("تعذر الوصول إلى الخدمة (قد تكون متوقفة).");
+              }
+
+              private String submit(String uploaded, String prompt, double duration, String token) throws Exception {
+                  JSONObject meta = new JSONObject();
+                  meta.put("_type", "gradio.FileData");
+                  JSONObject fd = new JSONObject();
+                  fd.put("path", uploaded);
+                  fd.put("meta", meta);
+
+                  JSONArray data = new JSONArray();
+                  data.put(fd);          // input_image
+                  data.put(prompt);      // prompt
+                  data.put(4);           // steps
+                  data.put("");          // negative_prompt
+                  data.put(duration);    // duration_seconds
+                  data.put(1);           // guidance_scale
+                  data.put(1);           // guidance_scale_2
+                  data.put(42);          // seed
+                  data.put(true);        // randomize_seed
+
+                  JSONObject req = new JSONObject();
+                  req.put("data", data);
+                  byte[] body = req.toString().getBytes(StandardCharsets.UTF_8);
+
+                  HttpURLConnection c = open(HOST + prefix + "/call/" + API_NAME, "POST", token);
+                  c.setDoOutput(true);
+                  c.setRequestProperty("Content-Type", "application/json");
+                  c.setFixedLengthStreamingMode(body.length);
+                  try (OutputStream os = c.getOutputStream()) {
+                      os.write(body);
+                  }
+                  int code = c.getResponseCode();
+                  String resp = readAll(code >= 400 ? c.getErrorStream() : c.getInputStream());
+                  if (code >= 400) {
+                      throw new IOException("طلب التوليد رُفض (HTTP " + code + "): " + clip(resp));
+                  }
+                  return new JSONObject(resp).getString("event_id");
+              }
+
+              private String waitResult(String eventId, String token) throws Exception {
+                  HttpURLConnection c = open(HOST + prefix + "/call/" + API_NAME + "/" + eventId, "GET", token);
+                  c.setReadTimeout(15 * 60 * 1000);
+                  int code = c.getResponseCode();
+                  if (code >= 400) {
+                      throw new IOException("تعذر قراءة النتيجة (HTTP " + code + "): "
+                              + clip(readAll(c.getErrorStream())));
+                  }
+                  long t0 = System.currentTimeMillis();
+                  BufferedReader br = new BufferedReader(
+                          new InputStreamReader(c.getInputStream(), StandardCharsets.UTF_8));
+                  String line;
+                  String event = null;
+                  while ((line = br.readLine()) != null) {
+                      if (line.startsWith("event:")) {
+                          event = line.substring(6).trim();
+                          long secs = (System.currentTimeMillis() - t0) / 1000;
+                          setStatus("جارٍ التوليد... مرّت " + secs + " ثانية");
+                      } else if (line.startsWith("data:")) {
+                          String d = line.substring(5).trim();
+                          if ("complete".equals(event)) return d;
+                          if ("error".equals(event)) {
+                              if (d.equals("null") || d.isEmpty()) {
+                                  throw new IOException("الخدمة أعادت خطأ دون تفاصيل. قد تكون الحصة المجانية "
+                                          + "انتهت أو الخدمة مشغولة. جرّب لاحقًا أو أضف مفتاح Hugging Face.");
+                              }
+                              throw new IOException("الخدمة أعادت خطأ: " + clip(d));
+                          }
+                      }
+                  }
+                  throw new IOException("انتهى الاتصال دون نتيجة.");
+              }
+
+              private String extractUrl(String data) throws Exception {
+                  JSONArray res = new JSONArray(data);
+                  Object first = res.get(0);
+                  if (first instanceof JSONObject) {
+                      JSONObject o = (JSONObject) first;
+                      if (o.has("video") && !o.isNull("video")) o = o.getJSONObject("video");
+                      String url = o.isNull("url") ? "" : o.optString("url", "");
+                      if (url.isEmpty() || url.equals("null")) {
+                          url = HOST + prefix + "/file=" + o.getString("path");
+                      }
+                      return url;
+                  } else if (first instanceof String) {
+                      return HOST + prefix + "/file=" + first;
+                  }
+                  throw new IOException("صيغة النتيجة غير متوقعة: " + clip(data));
+              }
+
+              private File download(String url, String token) throws Exception {
+                  File out = new File(getCacheDir(), "result.mp4");
+                  HttpURLConnection c = open(url, "GET", url.startsWith(HOST) ? token : null);
+                  c.setReadTimeout(180000);
+                  int code = c.getResponseCode();
+                  if (code >= 400) {
+                      throw new IOException("تنزيل الفيديو فشل (HTTP " + code + ")");
+                  }
+                  try (InputStream in = c.getInputStream(); FileOutputStream fo = new FileOutputStream(out)) {
+                      copy(in, fo);
+                  }
+                  return out;
+              }
+
+              private void showVideo(File f) {
+                  videoView.setVisibility(View.VISIBLE);
+                  MediaController mc = new MediaController(this);
+                  mc.setAnchorView(videoView);
+                  videoView.setMediaController(mc);
+                  videoView.setVideoPath(f.getAbsolutePath());
+                  videoView.setOnPreparedListener(mp -> {
+                      mp.setLooping(true);
+                      videoView.start();
+                  });
+                  saveBtn.setVisibility(View.VISIBLE);
+                  setStatus("تم! الفيديو جاهز.");
+              }
+
+              private void saveVideo() {
+                  if (resultFile == null) return;
+                  try {
+                      ContentValues v = new ContentValues();
+                      v.put(MediaStore.Video.Media.DISPLAY_NAME, "img2video_" + System.currentTimeMillis() + ".mp4");
+                      v.put(MediaStore.Video.Media.MIME_TYPE, "video/mp4");
+                      v.put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/Img2Video");
+                      v.put(MediaStore.Video.Media.IS_PENDING, 1);
+                      Uri u = getContentResolver().insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, v);
+                      if (u == null) throw new IOException("تعذر إنشاء الملف");
+                      try (OutputStream os = getContentResolver().openOutputStream(u);
+                           InputStream in = new FileInputStream(resultFile)) {
+                          copy(in, os);
+                      }
+                      ContentValues done = new ContentValues();
+                      done.put(MediaStore.Video.Media.IS_PENDING, 0);
+                      getContentResolver().update(u, done, null, null);
+                      toast("تم الحفظ في المعرض (Movies/Img2Video)");
+                  } catch (Exception e) {
+                      toast("فشل الحفظ: " + e.getMessage());
+                  }
+              }
+          }
+          EOF
+
+      - name: Build debug APK
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-34" "build-tools;34.0.0" || true
+          gradle -p app-project assembleDebug --no-daemon --stacktrace 2>&1 | tee build.log
+
+      - name: Collect APK
+        run: |
+          mkdir -p out
+          cp app-project/app/build/outputs/apk/debug/app-debug.apk out/Img2Video.apk
+          ls -la out
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Img2Video-apk
+          path: out/Img2Video.apk
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+
+      - name: Create smoke test script
+        run: |
+          cat > smoke.sh <<'EOF'
+          adb install -r out/Img2Video.apk
+          adb logcat -c
+          adb shell monkey -p com.img2video.app -c android.intent.category.LAUNCHER 1
+          sleep 15
+          adb logcat -d > logcat.txt
+          if adb shell pidof com.img2video.app > pid.txt && [ -s pid.txt ]; then echo RUNNING > result.txt; else echo NOT_RUNNING > result.txt; fi
+          if grep -q "FATAL EXCEPTION" logcat.txt; then echo CRASH >> result.txt; grep -A 25 "FATAL EXCEPTION" logcat.txt > crash.txt; fi
+          adb exec-out screencap -p > screen.png
+          EOF
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Smoke test on emulator
+        continue-on-error: true
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          arch: x86_64
+          target: google_apis
+          profile: pixel_6
+          disable-animations: true
+          script: bash smoke.sh
+
+      - name: Upload smoke results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-results
+          path: |
+            result.txt
+            crash.txt
+            pid.txt
+            logcat.txt
+            screen.png
